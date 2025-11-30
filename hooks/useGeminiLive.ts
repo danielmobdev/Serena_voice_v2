@@ -66,9 +66,16 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
       // 1. Initialize API
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // 2. Setup Audio Contexts
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      // 2. Setup Audio Contexts with low latency config
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const inputCtx = new AudioContextClass({ 
+        sampleRate: 16000,
+        latencyHint: 'interactive' 
+      });
+      const outputCtx = new AudioContextClass({ 
+        sampleRate: 24000,
+        latencyHint: 'interactive' 
+      });
       
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
@@ -80,8 +87,21 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
 
       outputGain.connect(outputCtx.destination);
 
-      // 3. Get Microphone
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 3. Get Microphone with aggressive noise suppression
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: { ideal: true },      
+          noiseSuppression: { ideal: true },      
+          autoGainControl: { ideal: true },       
+          // Chrome specific constraints for extra cleaning
+          googEchoCancellation: true,
+          googNoiseSuppression: true,
+          googAutoGainControl: true,
+          googHighpassFilter: true 
+        } as any 
+      });
       streamRef.current = stream;
 
       // 4. Connect to Gemini Live
@@ -93,22 +113,38 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
             
             // Setup Input Stream Processing
             const source = inputCtx.createMediaStreamSource(stream);
-            // Reduced buffer size from 4096 to 2048 to lower latency
-            const scriptProcessor = inputCtx.createScriptProcessor(2048, 1, 1);
+            
+            // Use 512 buffer for ultra-low latency (~32ms)
+            // This makes the conversation feel much faster
+            const scriptProcessor = inputCtx.createScriptProcessor(512, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
 
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               
-              // Calculate volume for visualizer
+              // 1. Calculate raw RMS (Volume)
               let sum = 0;
               for (let i = 0; i < inputData.length; i++) {
                 sum += inputData[i] * inputData[i];
               }
-              const rms = Math.sqrt(sum / inputData.length);
-              setVolume(Math.min(rms * 5, 1)); // Amplify a bit for visualizer
+              const rawRms = Math.sqrt(sum / inputData.length);
+              
+              // 2. NOISE GATE IMPLEMENTATION
+              // Threshold 0.01 filters out breathing/background hum but keeps speech.
+              // If volume is below threshold, we send SILENCE. 
+              // This prevents the AI from being interrupted by background noise.
+              const NOISE_THRESHOLD = 0.01; 
+              let dataToSend = inputData;
+              
+              if (rawRms < NOISE_THRESHOLD) {
+                 dataToSend = new Float32Array(inputData.length); // Send zeros
+              }
 
-              const pcmBlob = createPcmBlob(inputData);
+              // Update visualizer only if we are actually sending data
+              const effectiveRms = rawRms < NOISE_THRESHOLD ? 0 : rawRms;
+              setVolume(Math.min(effectiveRms * 5, 1)); 
+
+              const pcmBlob = createPcmBlob(dataToSend);
               
               if (sessionPromiseRef.current) {
                 sessionPromiseRef.current.then(session => {
@@ -123,7 +159,7 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
             // Send initial prompt to trigger greeting IMMEDIATELY
             sessionPromiseRef.current?.then(session => {
                session.sendRealtimeInput({
-                 content: { role: 'user', parts: [{ text: "The user has joined. Please say your initial greeting now." }] }
+                 content: { role: 'user', parts: [{ text: "The user has joined. Start the conversation immediately with your standard greeting." }] }
                });
             });
           },
@@ -207,6 +243,9 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
         },
         config: {
           responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+          },
           systemInstruction: SYSTEM_INSTRUCTION,
           tools: [{ functionDeclarations: [BOOK_APPOINTMENT_TOOL, END_CALL_TOOL] }]
         }

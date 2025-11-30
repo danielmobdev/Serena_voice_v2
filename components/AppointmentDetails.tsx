@@ -29,8 +29,8 @@ const AppointmentDetails: React.FC<Props> = ({ data }) => {
             <p className="font-semibold text-slate-800">{data.name}</p>
           </div>
           <div>
-            <p className="text-xs text-slate-500 uppercase tracking-wide">Age</p>
-            <p className="font-semibold text-slate-800">{data.age}</p>
+            <p className="text-xs text-slate-500 uppercase tracking-wide">Age / Gender</p>
+            <p className="font-semibold text-slate-800">{data.age} / {data.gender}</p>
           </div>
         </div>
 
@@ -57,10 +57,12 @@ const AppointmentDetails: React.FC<Props> = ({ data }) => {
            <p className="text-sm font-medium">{data.visitType}</p>
         </div>
 
-        <div>
-           <p className="text-xs text-slate-500 uppercase tracking-wide">Fee</p>
-           <p className="text-xl font-bold text-slate-800">₹{data.fee}</p>
-        </div>
+        {data.fee && (
+          <div>
+             <p className="text-xs text-slate-500 uppercase tracking-wide">Fee</p>
+             <p className="text-xl font-bold text-slate-800">₹{data.fee}</p>
+          </div>
+        )}
 
         <div className="pt-4 border-t border-slate-100">
            <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">Concern</p>

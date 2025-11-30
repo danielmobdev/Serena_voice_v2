@@ -1,13 +1,14 @@
 export interface AppointmentData {
   name: string;
   age: number;
+  gender: 'Male' | 'Female' | 'Other';
   mobile: string;
   visitType: 'First Visit' | 'Follow-up';
   concern: string;
   appointmentDate: string;
   appointmentTime: string;
   followUpInterval?: string;
-  fee: number;
+  fee?: number;
   language?: string;
 }
 

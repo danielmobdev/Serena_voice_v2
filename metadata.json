@@ -1,0 +1,7 @@
+{
+  "name": "Serenity Clinic AI Receptionist",
+  "description": "A conversational voice AI receptionist for Serenity Clinic specifically designed for Dr. Suvendu Narayana Mishra.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

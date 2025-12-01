@@ -26,57 +26,91 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
-  const disconnect = useCallback(() => {
-    // Stop all audio sources
-    sourcesRef.current.forEach(source => {
-      try { source.stop(); } catch (e) {}
-    });
-    sourcesRef.current.clear();
+  // Connection State Management
+  const currentConnectionIdRef = useRef<number>(0);
+  const isConnectedRef = useRef<boolean>(false);
 
-    // Close session
+  const disconnect = useCallback(() => {
+    // 1. Mark as disconnected immediately to stop audio loop
+    isConnectedRef.current = false;
+    currentConnectionIdRef.current += 1;
+
+    // 2. Stop all audio sources
+    if (sourcesRef.current) {
+      sourcesRef.current.forEach(source => {
+        try { source.stop(); } catch (e) {}
+      });
+      sourcesRef.current.clear();
+    }
+
+    // 3. Close session
     if (sessionPromiseRef.current) {
       sessionPromiseRef.current.then(session => {
-        try { session.close(); } catch(e) {}
-      });
+          try { session.close(); } catch(e) {}
+        }, () => {}).catch(() => {});
       sessionPromiseRef.current = null;
     }
 
-    // Stop mic stream
+    // 4. Stop mic stream
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current.getTracks().forEach(track => {
+        try { track.stop(); } catch(e) {}
+      });
       streamRef.current = null;
     }
 
-    // Close contexts
-    inputAudioContextRef.current?.close();
-    outputAudioContextRef.current?.close();
+    // 5. Disconnect nodes safely
+    try { scriptProcessorRef.current?.disconnect(); } catch(e) {}
+    scriptProcessorRef.current = null;
 
-    // Disconnect nodes
-    scriptProcessorRef.current?.disconnect();
+    // 6. Close contexts safely
+    if (inputAudioContextRef.current) {
+      try {
+        if (inputAudioContextRef.current.state !== 'closed') {
+           inputAudioContextRef.current.close().catch(() => {});
+        }
+      } catch (e) {}
+      inputAudioContextRef.current = null;
+    }
+
+    if (outputAudioContextRef.current) {
+      try {
+        if (outputAudioContextRef.current.state !== 'closed') {
+           outputAudioContextRef.current.close().catch(() => {});
+        }
+      } catch(e) {}
+      outputAudioContextRef.current = null;
+    }
     
     setConnectionState(ConnectionState.DISCONNECTED);
     setVolume(0);
   }, []);
 
   const connect = useCallback(async () => {
+    disconnect();
+    
+    const connectionId = currentConnectionIdRef.current + 1;
+    currentConnectionIdRef.current = connectionId;
+
     try {
       setConnectionState(ConnectionState.CONNECTING);
       setError(null);
 
-      // 1. Initialize API
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // 2. Setup Audio Contexts with low latency config
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const inputCtx = new AudioContextClass({ 
-        sampleRate: 16000,
-        latencyHint: 'interactive' 
-      });
-      const outputCtx = new AudioContextClass({ 
-        sampleRate: 24000,
-        latencyHint: 'interactive' 
-      });
+      const inputCtx = new AudioContextClass({ sampleRate: 16000, latencyHint: 'interactive' });
+      const outputCtx = new AudioContextClass({ sampleRate: 24000, latencyHint: 'interactive' });
       
+      if (inputCtx.state === 'suspended') await inputCtx.resume();
+      if (outputCtx.state === 'suspended') await outputCtx.resume();
+
+      if (currentConnectionIdRef.current !== connectionId) {
+        try { inputCtx.close(); } catch(e) {}
+        try { outputCtx.close(); } catch(e) {}
+        return;
+      }
+
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
 
@@ -84,10 +118,8 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
       const outputGain = outputCtx.createGain();
       inputNodeRef.current = inputGain;
       outputNodeRef.current = outputGain;
-
       outputGain.connect(outputCtx.destination);
 
-      // 3. Get Microphone with aggressive noise suppression
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
@@ -95,52 +127,56 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
           echoCancellation: { ideal: true },      
           noiseSuppression: { ideal: true },      
           autoGainControl: { ideal: true },       
-          // Chrome specific constraints for extra cleaning
           googEchoCancellation: true,
           googNoiseSuppression: true,
           googAutoGainControl: true,
           googHighpassFilter: true 
         } as any 
       });
+
+      if (currentConnectionIdRef.current !== connectionId) {
+        stream.getTracks().forEach(t => t.stop());
+        try { inputCtx.close(); } catch(e) {}
+        try { outputCtx.close(); } catch(e) {}
+        return;
+      }
+
       streamRef.current = stream;
 
-      // 4. Connect to Gemini Live
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         callbacks: {
           onopen: () => {
+            if (currentConnectionIdRef.current !== connectionId) return;
+            
+            isConnectedRef.current = true;
             setConnectionState(ConnectionState.CONNECTED);
             
-            // Setup Input Stream Processing
             const source = inputCtx.createMediaStreamSource(stream);
-            
-            // Use 512 buffer for ultra-low latency (~32ms)
-            // This makes the conversation feel much faster
-            const scriptProcessor = inputCtx.createScriptProcessor(512, 1, 1);
+            // Increased buffer size to 2048 to prevent network saturation and "Network Error" crashes
+            const scriptProcessor = inputCtx.createScriptProcessor(2048, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
 
             scriptProcessor.onaudioprocess = (e) => {
+              if (currentConnectionIdRef.current !== connectionId || !isConnectedRef.current) return;
+              if (!inputCtx || inputCtx.state === 'closed') return;
+
               const inputData = e.inputBuffer.getChannelData(0);
               
-              // 1. Calculate raw RMS (Volume)
+              // Volume calculation
               let sum = 0;
               for (let i = 0; i < inputData.length; i++) {
                 sum += inputData[i] * inputData[i];
               }
               const rawRms = Math.sqrt(sum / inputData.length);
               
-              // 2. NOISE GATE IMPLEMENTATION
-              // Threshold 0.01 filters out breathing/background hum but keeps speech.
-              // If volume is below threshold, we send SILENCE. 
-              // This prevents the AI from being interrupted by background noise.
               const NOISE_THRESHOLD = 0.01; 
               let dataToSend = inputData;
               
               if (rawRms < NOISE_THRESHOLD) {
-                 dataToSend = new Float32Array(inputData.length); // Send zeros
+                 dataToSend = new Float32Array(inputData.length); 
               }
 
-              // Update visualizer only if we are actually sending data
               const effectiveRms = rawRms < NOISE_THRESHOLD ? 0 : rawRms;
               setVolume(Math.min(effectiveRms * 5, 1)); 
 
@@ -148,63 +184,80 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
               
               if (sessionPromiseRef.current) {
                 sessionPromiseRef.current.then(session => {
-                  session.sendRealtimeInput({ media: pcmBlob });
-                });
+                  if (currentConnectionIdRef.current !== connectionId || !isConnectedRef.current) return;
+                  try {
+                    session.sendRealtimeInput({ media: pcmBlob });
+                  } catch (e) {
+                    // Ignore synchronous send errors
+                  }
+                }).catch(() => {});
               }
             };
 
             source.connect(scriptProcessor);
             scriptProcessor.connect(inputCtx.destination);
 
-            // Send initial prompt to trigger greeting IMMEDIATELY
-            sessionPromiseRef.current?.then(session => {
-               session.sendRealtimeInput({
-                 content: { role: 'user', parts: [{ text: "The user has joined. Start the conversation immediately with your standard greeting." }] }
-               });
-            });
+            // Send trigger message with slight delay to ensure readiness
+            setTimeout(() => {
+                sessionPromiseRef.current?.then(session => {
+                   if (currentConnectionIdRef.current !== connectionId || !isConnectedRef.current) return;
+                   try {
+                     session.sendRealtimeInput({
+                       content: { role: 'user', parts: [{ text: "start_conversation" }] }
+                     });
+                   } catch (e) {
+                     // Suppress trigger errors
+                   }
+                }).catch(() => {});
+            }, 200);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle Tool Calls
+            if (currentConnectionIdRef.current !== connectionId || !isConnectedRef.current) return;
+
             if (message.toolCall) {
               for (const fc of message.toolCall.functionCalls) {
                 if (fc.name === 'bookAppointment') {
                   const args = fc.args as unknown as AppointmentData;
                   onAppointmentBooked(args);
                   
-                  // Send success response back to model
                   sessionPromiseRef.current?.then(session => {
-                    session.sendToolResponse({
-                      functionResponses: {
-                        id: fc.id,
-                        name: fc.name,
-                        response: { result: "Success. Appointment saved to database." }
-                      }
-                    });
-                  });
+                    try {
+                      session.sendToolResponse({
+                        functionResponses: {
+                          id: fc.id,
+                          name: fc.name,
+                          response: { result: "Success. Appointment saved to database." }
+                        }
+                      });
+                    } catch (e) { console.error("Tool response failed:", e); }
+                  }).catch(() => {});
                 } else if (fc.name === 'endCall') {
-                  // Send simple response then disconnect after audio plays
                   sessionPromiseRef.current?.then(session => {
-                    session.sendToolResponse({
-                      functionResponses: {
-                        id: fc.id,
-                        name: fc.name,
-                        response: { result: "Call ended" }
-                      }
-                    });
-                  });
+                    try {
+                      session.sendToolResponse({
+                        functionResponses: {
+                          id: fc.id,
+                          name: fc.name,
+                          response: { result: "Call ended" }
+                        }
+                      });
+                    } catch (e) { console.error("End call response failed:", e); }
+                  }).catch(() => {});
                   
-                  // Wait for the "Goodbye" audio to finish playing (approx 4s) then disconnect
                   setTimeout(() => {
-                    disconnect();
+                    if (currentConnectionIdRef.current === connectionId) {
+                      disconnect();
+                    }
                   }, 4000);
                 }
               }
             }
 
-            // Handle Audio Output
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current && outputNodeRef.current) {
               const ctx = outputAudioContextRef.current;
+              if (ctx.state === 'closed') return;
+
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               
               const audioBytes = base64ToUint8Array(base64Audio);
@@ -223,7 +276,6 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
               sourcesRef.current.add(source);
             }
 
-            // Handle Interruption
             if (message.serverContent?.interrupted) {
               sourcesRef.current.forEach(source => {
                 try { source.stop(); } catch (e) {}
@@ -233,12 +285,30 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
             }
           },
           onclose: () => {
-             setConnectionState(ConnectionState.DISCONNECTED);
+             if (currentConnectionIdRef.current === connectionId) {
+               setConnectionState(ConnectionState.DISCONNECTED);
+               isConnectedRef.current = false;
+             }
           },
-          onerror: (err) => {
-            console.error(err);
-            setError("Connection error. Please try again.");
-            setConnectionState(ConnectionState.ERROR);
+          onerror: (err: any) => {
+            if (currentConnectionIdRef.current === connectionId) {
+              const errorMessage = err?.message || err?.toString() || '';
+              
+              // Ignore benign errors or race-condition network errors
+              if (
+                  errorMessage.includes("cancelled") || 
+                  errorMessage.includes("closed") || 
+                  errorMessage.includes("Network error") || 
+                  errorMessage.includes("aborted")
+              ) {
+                return;
+              }
+              
+              console.error("Session Error:", err);
+              setError("Connection error. Please try again.");
+              setConnectionState(ConnectionState.ERROR);
+              isConnectedRef.current = false;
+            }
           }
         },
         config: {
@@ -251,16 +321,27 @@ export const useGeminiLive = ({ onAppointmentBooked }: UseGeminiLiveProps) => {
         }
       });
       
+      sessionPromise.then(() => {}, (err) => {
+         if (currentConnectionIdRef.current === connectionId) {
+           console.error("Connection Handshake Failed:", err);
+           setConnectionState(ConnectionState.ERROR);
+           setError("Unable to connect. Please check your network or API key.");
+           isConnectedRef.current = false;
+         }
+      });
+
       sessionPromiseRef.current = sessionPromise;
 
     } catch (err: any) {
-      console.error(err);
-      setError(err.message || "Failed to connect");
-      setConnectionState(ConnectionState.ERROR);
+      if (currentConnectionIdRef.current === connectionId) {
+        console.error("Setup Failed:", err);
+        setError("Failed to initialize connection.");
+        setConnectionState(ConnectionState.ERROR);
+        disconnect();
+      }
     }
   }, [onAppointmentBooked, disconnect]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => disconnect();
   }, [disconnect]);
